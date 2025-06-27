@@ -3,62 +3,71 @@
 import angr
 import claripy
 
-MAX_ARG_LEN = 8
-NUM_ARGS = 5
-
-def make_symbolic_args():
-    args = []
-    for i in range(NUM_ARGS):
-        chars = [claripy.BVS(f'arg{i}_{j}', 8) for j in range(MAX_ARG_LEN)]
-        arg = claripy.Concat(*chars + [claripy.BVV(0, 8)])  # Null-terminated string
-        args.append((arg, chars))
-    return args
-
-def create_state(project, symbolic_args):
-    args = [project.filename] + [arg for arg, _ in symbolic_args]
-    state = project.factory.full_init_state(args=args)
-
-    # Zero-fill to avoid memory access warnings (e.g., from strlen)
-    state.options.add(angr.options.ZERO_FILL_UNCONSTRAINED_MEMORY)
-    state.options.add(angr.options.ZERO_FILL_UNCONSTRAINED_REGISTERS)
-
-    # Constrain all characters to printable ASCII
-    for _, chars in symbolic_args:
-        for c in chars:
-            state.solver.add(c >= 0x20)
-            state.solver.add(c <= 0x7e)
-
-    return state
-
-def run_and_get_terminated(project, symbolic_args):
-    state = create_state(project, symbolic_args)
-    simgr = project.factory.simgr(state)
-    simgr.run()
-    return simgr.deadended
-
 def main():
-    proj1 = angr.Project("bin/version1", auto_load_libs=False)
-    proj2 = angr.Project("bin/version2", auto_load_libs=False)
+    binary1 = 'bin/version1'
+    binary2 = 'bin/version2'
+    num_args = 5
+    max_arg_len = 8  # Each argument is at most 8 characters
 
-    symbolic_args = make_symbolic_args()
+    # Create symbolic variables for each argument
+    symbolic_args = []
+    for i in range(num_args):
+        arg = [claripy.BVS(f'arg{i}_{j}', 8) for j in range(max_arg_len)]
+        arg_concat = claripy.Concat(*arg)
+        arg_null_terminated = claripy.Concat(arg_concat, claripy.BVV(0, 8))  # C-style null-terminated string
+        symbolic_args.append(arg_null_terminated)
 
-    states_v1 = run_and_get_terminated(proj1, symbolic_args)
-    states_v2 = run_and_get_terminated(proj2, symbolic_args)
+    # List of full argv for both binaries
+    argv = ['binary'] + symbolic_args  # dummy program name at argv[0]
 
-    for s1 in states_v1:
-        for s2 in states_v2:
-            out1 = s1.posix.dumps(1)
-            out2 = s2.posix.dumps(1)
+    # Create projects
+    proj1 = angr.Project(binary1, auto_load_libs=False)
+    proj2 = angr.Project(binary2, auto_load_libs=False)
 
-            if s1.solver.satisfiable(extra_constraints=[out1 != out2]):
-                solver = s1.solver
-                with open("regressing.txt", "w") as f:
-                    for _, chars in symbolic_args:
-                        concrete = b''.join([solver.eval(c, cast_to=bytes) for c in chars])
-                        printable = concrete.rstrip(b'\x00').decode('utf-8', errors='ignore')
-                        f.write(printable + " ")
-                    f.write("\n")
-                print("[+] Regression detected. Inputs written to regressing.txt")
+    # Create initial symbolic states for both binaries
+    state1 = proj1.factory.full_init_state(args=argv)
+    state2 = proj2.factory.full_init_state(args=argv)
+
+    # Ensure uninitialized memory doesn't cause strlen issues
+    state1.options.add(angr.options.ZERO_FILL_UNCONSTRAINED_MEMORY)
+    state2.options.add(angr.options.ZERO_FILL_UNCONSTRAINED_MEMORY)
+
+    # Optional: constrain characters to printable ASCII
+    for arg in symbolic_args:
+        for byte in arg.chop(8):
+            state1.solver.add(byte >= 0x20, byte <= 0x7e)
+            state2.solver.add(byte >= 0x20, byte <= 0x7e)
+
+    # Create simulation managers
+    sm1 = proj1.factory.simulation_manager(state1)
+    sm2 = proj2.factory.simulation_manager(state2)
+
+    # Run both programs until they terminate
+    sm1.run()
+    sm2.run()
+
+    # Compare output in final states
+    for s1 in sm1.deadended:
+        for s2 in sm2.deadended:
+            stdout1 = s1.posix.dumps(1)
+            stdout2 = s2.posix.dumps(1)
+
+            if stdout1 != stdout2:
+                print("[+] Found regression bug!")
+                print(f"version1 output: {stdout1}")
+                print(f"version2 output: {stdout2}")
+
+                # Solve for concrete argument values
+                concrete_args = []
+                for arg in symbolic_args:
+                    val = s1.solver.eval(arg, cast_to=bytes)
+                    concrete_args.append(val.strip(b"\x00"))  # remove null terminator
+
+                # Write to regressing.txt (space-separated)
+                with open("regressing.txt", "wb") as f:
+                    f.write(b" ".join(concrete_args))
+
+                print("[+] Arguments written to regressing.txt")
                 return
 
     print("[-] No regression found.")
