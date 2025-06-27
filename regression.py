@@ -1,76 +1,60 @@
-#!/usr/bin/env python3
 import angr
 import claripy
 
-BIN1 = "bin/version1"
-BIN2 = "bin/version2"
+MAX_ARG_LEN = 8
 NUM_ARGS = 5
-MAX_LEN = 8
 
-def make_symbolic_args():
+def symbolic_args():
     args = []
     for i in range(NUM_ARGS):
-        chars = [claripy.BVS(f"arg{i}_{j}", 8) for j in range(MAX_LEN)]
-        arg = claripy.Concat(*chars, claripy.BVV(0, 8))
+        arg = claripy.BVS(f'arg{i}', MAX_ARG_LEN * 8)  # 8 bits per char
         args.append(arg)
     return args
 
-def instrument_printf(state, tag):
-    out_data = []
-    @state.inspect.b('syscall', when=angr.BP_AFTER)
-    def catch_write(state2):
-        if state2.inspect.syscall_name == "write" and state2.inspect.syscall_arg(0) == 1:
-            data = state2.mem[state2.inspect.syscall_arg(1)].string.concrete
-            out_data.append(data)
-    state.globals[tag] = out_data
+def create_state(proj, sym_args):
+    # Construct argv with filename as first arg, then symbolic args
+    argv = [proj.filename]
+    for arg in sym_args:
+        # Add null terminator for each string and limit length to MAX_ARG_LEN
+        argv.append(arg)
+    state = proj.factory.full_init_state(args=argv)
+
+    # Constrain symbolic arguments to be printable and null-terminated within 8 bytes
+    for arg in sym_args:
+        for i in range(MAX_ARG_LEN):
+            c = arg.get_byte(i)
+            state.solver.add(c >= 0x20)
+            state.solver.add(c <= 0x7e)
+    return state
+
+def get_terminated_states(proj, sym_args):
+    state = create_state(proj, sym_args)
+    simgr = proj.factory.simgr(state)
+    simgr.run()
+    return simgr.deadended
 
 def main():
-    sym_args = make_symbolic_args()
-    argv = ["prog"] + sym_args
+    proj1 = angr.Project('bin/version1', auto_load_libs=False)
+    proj2 = angr.Project('bin/version2', auto_load_libs=False)
 
-    proj1 = angr.Project(BIN1, auto_load_libs=False)
-    proj2 = angr.Project(BIN2, auto_load_libs=False)
+    sym_args = symbolic_args()
 
-    s1 = proj1.factory.full_init_state(args=argv)
-    s2 = proj2.factory.full_init_state(args=argv)
+    states_v1 = get_terminated_states(proj1, sym_args)
+    states_v2 = get_terminated_states(proj2, sym_args)
 
-    for st in (s1, s2):
-        st.options.add(angr.options.ZERO_FILL_UNCONSTRAINED_MEMORY)
-        for arg in sym_args:
-            for byte in arg.chop(8):
-                st.solver.add(byte >= 0x20, byte <= 0x7e)
-
-    instrument_printf(s1, "out1")
-    instrument_printf(s2, "out2")
-
-    simgr1 = proj1.factory.simulation_manager(s1)
-    simgr2 = proj2.factory.simulation_manager(s2)
-
-    # Run side-by-side until one diverges or ends
-    for _ in range(200):
-        if not simgr1.active or not simgr2.active:
-            break
-        simgr1.step()
-        simgr2.step()
-
-        for st1 in simgr1.active:
-            for st2 in simgr2.active:
-                o1 = b"".join(st1.globals["out1"])
-                o2 = b"".join(st2.globals["out2"])
-                if st1.solver.satisfiable(extra_constraints=[o1 != o2]):
-                    print("[+] Found divergence in printed output!")
-                    args = []
+    for s1 in states_v1:
+        for s2 in states_v2:
+            # Check for diverging behavior - here: different exit codes
+            if s1.solver.satisfiable(extra_constraints=[s1.regs.eax != s2.regs.eax]):
+                m = s1.solver.min
+                with open("regressing.txt", "w") as f:
                     for arg in sym_args:
-                        v = st1.solver.eval(arg, cast_to=bytes).split(b'\x00')[0]
-                        args.append(v)
-                    with open("regressing.txt", "wb") as f:
-                        f.write(b" ".join(args))
-                    print("[+] Arguments saved in regressing.txt")
-                    print("version1 printed:", o1)
-                    print("version2 printed:", o2)
-                    return
+                        val = m(s1.solver.eval(arg, cast_to=bytes).rstrip(b'\x00'))
+                        f.write(val.decode('utf-8', errors='ignore') + " ")
+                    f.write("\n")
+                print("Regression found! Inputs written to regressing.txt")
+                return
+    print("No regression found.")
 
-    print("[-] No divergence found.")
-
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
