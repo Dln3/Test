@@ -2,69 +2,69 @@
 
 import angr
 import claripy
-import subprocess
+import os
 
 def main():
     binary1 = 'bin/version1'
     binary2 = 'bin/version2'
     num_args = 5
-    max_arg_len = 8
+    max_arg_len = 8  # Each argument is at most 8 characters
 
-    # Create symbolic args
+    # Create symbolic variables for each argument
     symbolic_args = []
     for i in range(num_args):
         chars = [claripy.BVS(f'arg{i}_{j}', 8) for j in range(max_arg_len)]
-        arg = claripy.Concat(*chars, claripy.BVV(0,8))  # null terminate
-        symbolic_args.append((arg, chars))
+        arg = claripy.Concat(*chars)
+        arg = claripy.Concat(arg, claripy.BVV(0, 8))  # null-terminated
+        symbolic_args.append(arg)
 
-    # Setup angr project for version1 only
+    # Arguments passed to binary (argv[0] is dummy)
+    argv = ['binary'] + symbolic_args
+
+    # Setup project for version1 (symbolic execution)
     proj1 = angr.Project(binary1, auto_load_libs=False)
+    state1 = proj1.factory.full_init_state(args=argv)
+    state1.options.add(angr.options.ZERO_FILL_UNCONSTRAINED_MEMORY)
 
-    # Create initial state with symbolic args
-    argv = [binary1] + [arg for arg, _ in symbolic_args]
-    state = proj1.factory.full_init_state(args=argv)
+    # Constrain all characters to printable ASCII
+    for arg in symbolic_args:
+        for byte in arg.chop(8):
+            state1.solver.add(byte >= 0x20)
+            state1.solver.add(byte <= 0x7e)
 
-    # Avoid strlen reading garbage
-    state.options.add(angr.options.ZERO_FILL_UNCONSTRAINED_MEMORY)
-    state.options.add(angr.options.ZERO_FILL_UNCONSTRAINED_REGISTERS)
+    sm1 = proj1.factory.simulation_manager(state1)
+    sm1.run()
 
-    # constrain symbolic bytes to printable ascii
-    for _, chars in symbolic_args:
-        for c in chars:
-            state.solver.add(c >= 0x20)
-            state.solver.add(c <= 0x7e)
+    # Check outputs of all deadended paths in version1
+    for s1 in sm1.deadended:
+        output1 = s1.posix.dumps(1)
 
-    simgr = proj1.factory.simgr(state)
+        # Concretize arguments
+        concrete_args = [s1.solver.eval(arg, cast_to=bytes).strip(b"\x00") for arg in symbolic_args]
+        concrete_args_str = [arg.decode("utf-8", errors="ignore") for arg in concrete_args]
 
-    # Limit steps to avoid explosion
-    simgr.run(n=1000)
+        # Re-execute version2 concretely with same args
+        proj2 = angr.Project(binary2, auto_load_libs=False)
+        state2 = proj2.factory.full_init_state(args=['binary'] + concrete_args_str)
+        state2.options.add(angr.options.ZERO_FILL_UNCONSTRAINED_MEMORY)
 
-    print(f"Explored {len(simgr.deadended)} finished states in version1")
+        sm2 = proj2.factory.simulation_manager(state2)
+        sm2.run()
 
-    # For each finished path in version1, concretize input and run version2 concretely
-    for deadend_state in simgr.deadended:
-        solver = deadend_state.solver
-        concrete_args = []
-        for _, chars in symbolic_args:
-            concrete = b''.join(solver.eval(c, cast_to=bytes) for c in chars).rstrip(b'\x00')
-            concrete_args.append(concrete.decode('utf-8', errors='ignore'))
+        # There may be multiple deadended paths, but we only need the output from the one that terminates normally
+        for s2 in sm2.deadended:
+            output2 = s2.posix.dumps(1)
+            if output1 != output2:
+                print("[+] Found regression!")
+                print(f"version1 output:\n{output1}")
+                print(f"version2 output:\n{output2}")
 
-        # Get version1 output (already symbolic exec)
-        out1 = deadend_state.posix.dumps(1)
+                # Write to regressing.txt
+                with open("regressing.txt", "wb") as f:
+                    f.write(b" ".join(concrete_args))
 
-        # Run version2 concretely with same input
-        proc = subprocess.run([binary2] + concrete_args, capture_output=True)
-        out2 = proc.stdout
-
-        if out1 != out2:
-            print("[+] Regression found!")
-            print(f"version1 output: {out1}")
-            print(f"version2 output: {out2}")
-
-            with open("regressing.txt", "w") as f:
-                f.write(" ".join(concrete_args) + "\n")
-
-            return
+                print("[+] Saved input to regressing.txt")
+                return
 
     print("[-] No regression found.")
 
