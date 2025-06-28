@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-
 import angr
 import claripy
+import os
 
 def main():
     binary1 = 'bin/version1'
@@ -12,163 +12,149 @@ def main():
     # Create symbolic variables for each argument
     symbolic_args = []
     for i in range(num_args):
-        # Create symbolic string without null terminator first
-        arg = claripy.BVS(f'arg{i}', max_arg_len * 8)
+        chars = [claripy.BVS(f'arg{i}_{j}', 8) for j in range(max_arg_len)]
+        arg = claripy.Concat(*chars)
+        arg = claripy.Concat(arg, claripy.BVV(0, 8))  # null-terminated
         symbolic_args.append(arg)
 
-    # Create projects
+    argv = ['binary'] + symbolic_args
+
+    # Setup project for version1 (symbolic execution)
     proj1 = angr.Project(binary1, auto_load_libs=False)
-    proj2 = angr.Project(binary2, auto_load_libs=False)
-
-    # Create initial symbolic states for both binaries
-    state1 = proj1.factory.full_init_state(args=['binary'] + symbolic_args)
-    state2 = proj2.factory.full_init_state(args=['binary'] + symbolic_args)
-
-    # Add important options
+    state1 = proj1.factory.full_init_state(args=argv)
+    
+    # Add memory safety options
     state1.options.add(angr.options.ZERO_FILL_UNCONSTRAINED_MEMORY)
-    state2.options.add(angr.options.ZERO_FILL_UNCONSTRAINED_MEMORY)
     state1.options.add(angr.options.SYMBOL_FILL_UNCONSTRAINED_MEMORY)
-    state2.options.add(angr.options.SYMBOL_FILL_UNCONSTRAINED_MEMORY)
-
-    # Constrain arguments to printable ASCII characters
+    
+    # Constrain all characters to printable ASCII
     for arg in symbolic_args:
-        bytes_list = arg.chop(8)
-        for byte_val in bytes_list:
-            state1.solver.add(byte_val >= 0x20)  # Space
-            state1.solver.add(byte_val <= 0x7e)  # Tilde
-            state2.solver.add(byte_val >= 0x20)
-            state2.solver.add(byte_val <= 0x7e)
+        for byte in arg.chop(8)[:-1]:  # Skip null terminator
+            state1.solver.add(byte >= 0x20)
+            state1.solver.add(byte <= 0x7e)
 
-    # Create simulation managers
     sm1 = proj1.factory.simulation_manager(state1)
-    sm2 = proj2.factory.simulation_manager(state2)
-
-    # Step through both programs simultaneously
-    max_steps = 1000
-    step_count = 0
     
-    while (sm1.active or sm2.active) and step_count < max_steps:
-        if sm1.active:
-            sm1.step()
-        if sm2.active:
-            sm2.step()
-        step_count += 1
+    # CRITICAL: Limit exploration to prevent memory explosion
+    max_states = 50  # Limit total states to prevent memory issues
+    max_steps = 1000  # Limit execution steps
+    
+    print("Starting symbolic execution of version1...")
+    try:
+        # Use explore with limits instead of run()
+        sm1.explore(
+            num_find=max_states,  # Stop after finding this many paths
+            step_func=lambda sm: sm if len(sm.active) + len(sm.deadended) < max_states else sm.prune()
+        )
         
-        # Check for differences in output periodically
-        if step_count % 50 == 0:
-            print(f"Step {step_count}: sm1 active: {len(sm1.active)}, sm2 active: {len(sm2.active)}")
-
-    # Alternative approach: Run to completion with timeout
-    print("Running version1...")
-    try:
-        sm1.run(timeout=60)
+        # Alternative: step with limits
+        step_count = 0
+        while sm1.active and step_count < max_steps and len(sm1.active) + len(sm1.deadended) < max_states:
+            sm1.step()
+            step_count += 1
+            
+            # Prune states periodically to manage memory
+            if step_count % 100 == 0:
+                print(f"Step {step_count}: Active={len(sm1.active)}, Deadended={len(sm1.deadended)}")
+                if len(sm1.active) > 20:  # Too many active states
+                    # Keep only first 10 active states
+                    sm1.active = sm1.active[:10]
+                    print("Pruned active states to manage memory")
+        
     except Exception as e:
-        print(f"Version1 execution exception: {e}")
+        print(f"Error during symbolic execution: {e}")
+        return
+
+    print(f"Symbolic execution complete. Deadended states: {len(sm1.deadended)}")
     
-    print("Running version2...")
-    try:
-        sm2.run(timeout=60)
-    except Exception as e:
-        print(f"Version2 execution exception: {e}")
+    if not sm1.deadended:
+        print("[-] No deadended states found in version1")
+        return
 
-    print(f"Version1 - Deadended: {len(sm1.deadended)}, Active: {len(sm1.active)}, Errored: {len(sm1.errored)}")
-    print(f"Version2 - Deadended: {len(sm2.deadended)}, Active: {len(sm2.active)}, Errored: {len(sm2.errored)}")
-
-    # Compare outputs from deadended states
+    # Create project for version2 once (reuse it)
+    proj2 = angr.Project(binary2, auto_load_libs=False)
+    
+    # Check outputs of deadended paths in version1
     found_regression = False
+    checked_count = 0
+    max_checks = 20  # Limit how many states we check to prevent infinite loops
     
-    # If we have deadended states, compare them
-    if sm1.deadended and sm2.deadended:
-        for i, s1 in enumerate(sm1.deadended):
-            for j, s2 in enumerate(sm2.deadended):
+    for i, s1 in enumerate(sm1.deadended[:max_checks]):  # Limit states checked
+        try:
+            print(f"Checking deadended state {i+1}/{min(len(sm1.deadended), max_checks)}")
+            
+            # Get output from version1
+            output1 = s1.posix.dumps(1)
+            
+            # Concretize arguments
+            concrete_args = []
+            for j, arg in enumerate(symbolic_args):
                 try:
-                    # Get stdout from both states
-                    stdout1 = s1.posix.dumps(1)
-                    stdout2 = s2.posix.dumps(1)
+                    concrete_val = s1.solver.eval(arg, cast_to=bytes).strip(b"\x00")
+                    concrete_str = concrete_val.decode("utf-8", errors="ignore")
+                    concrete_args.append(concrete_str)
+                except Exception as e:
+                    print(f"Error concretizing arg {j}: {e}")
+                    concrete_args.append("")  # Use empty string as fallback
+            
+            print(f"Testing args: {concrete_args}")
+            
+            # Re-execute version2 concretely with same args
+            try:
+                state2 = proj2.factory.full_init_state(args=['binary'] + concrete_args)
+                state2.options.add(angr.options.ZERO_FILL_UNCONSTRAINED_MEMORY)
+                
+                sm2 = proj2.factory.simulation_manager(state2)
+                
+                # Run version2 with timeout and step limit
+                step_count2 = 0
+                max_steps2 = 500
+                
+                while sm2.active and step_count2 < max_steps2:
+                    sm2.step()
+                    step_count2 += 1
+                
+                # Check if version2 completed normally
+                if not sm2.deadended:
+                    print(f"  Version2 didn't complete normally (active: {len(sm2.active)}, errored: {len(sm2.errored)})")
+                    continue
+                
+                # Compare outputs
+                for s2 in sm2.deadended:
+                    output2 = s2.posix.dumps(1)
                     
-                    print(f"Comparing state1[{i}] vs state2[{j}]")
-                    print(f"  stdout1: {stdout1}")
-                    print(f"  stdout2: {stdout2}")
+                    print(f"  v1 output: {repr(output1)}")
+                    print(f"  v2 output: {repr(output2)}")
                     
-                    if stdout1 != stdout2:
-                        print("[+] Found regression bug!")
-                        print(f"version1 output: {stdout1}")
-                        print(f"version2 output: {stdout2}")
-                        
-                        # Solve for concrete argument values
-                        concrete_args = []
-                        for k, arg in enumerate(symbolic_args):
-                            try:
-                                val = s1.solver.eval(arg, cast_to=bytes)
-                                # Convert to string and strip null bytes
-                                arg_str = val.decode('ascii', errors='ignore').rstrip('\x00')
-                                concrete_args.append(arg_str)
-                                print(f"  arg{k}: '{arg_str}'")
-                            except Exception as e:
-                                print(f"Error evaluating arg{k}: {e}")
-                                concrete_args.append("ERROR")
+                    if output1 != output2:
+                        print("[+] Found regression!")
+                        print(f"Arguments: {concrete_args}")
+                        print(f"version1 output: {output1}")
+                        print(f"version2 output: {output2}")
                         
                         # Write to regressing.txt
                         with open("regressing.txt", "w") as f:
                             f.write(" ".join(concrete_args))
                         
-                        print("[+] Arguments written to regressing.txt")
+                        print("[+] Saved input to regressing.txt")
                         found_regression = True
-                        return
-                        
-                except Exception as e:
-                    print(f"Error comparing states: {e}")
-                    continue
-    
-    # Alternative: If no deadended states, try a different approach
-    if not found_regression and not sm1.deadended and not sm2.deadended:
-        print("No deadended states found. Trying alternative approach...")
-        
-        # Use explore to find different paths
-        state1_copy = proj1.factory.full_init_state(args=['binary'] + symbolic_args)
-        state2_copy = proj2.factory.full_init_state(args=['binary'] + symbolic_args)
-        
-        # Add the same constraints
-        for arg in symbolic_args:
-            bytes_list = arg.chop(8)
-            for byte_val in bytes_list:
-                state1_copy.solver.add(byte_val >= 0x20, byte_val <= 0x7e)
-                state2_copy.solver.add(byte_val >= 0x20, byte_val <= 0x7e)
-        
-        sm1_alt = proj1.factory.simulation_manager(state1_copy)
-        sm2_alt = proj2.factory.simulation_manager(state2_copy)
-        
-        # Explore with find condition (look for any exit)
-        sm1_alt.explore(find=lambda s: True, num_find=10)
-        sm2_alt.explore(find=lambda s: True, num_find=10)
-        
-        print(f"Alternative - Found states: v1={len(sm1_alt.found)}, v2={len(sm2_alt.found)}")
-        
-        # Compare found states
-        for s1 in sm1_alt.found[:5]:  # Limit to first 5 to avoid too many comparisons
-            for s2 in sm2_alt.found[:5]:
-                try:
-                    stdout1 = s1.posix.dumps(1)
-                    stdout2 = s2.posix.dumps(1)
+                        break
+                
+                if found_regression:
+                    break
                     
-                    if stdout1 != stdout2:
-                        print("[+] Found regression in alternative search!")
-                        
-                        concrete_args = []
-                        for k, arg in enumerate(symbolic_args):
-                            val = s1.solver.eval(arg, cast_to=bytes)
-                            arg_str = val.decode('ascii', errors='ignore').rstrip('\x00')
-                            concrete_args.append(arg_str)
-                        
-                        with open("regressing.txt", "w") as f:
-                            f.write(" ".join(concrete_args))
-                        
-                        return
-                except:
-                    continue
-
+            except Exception as e:
+                print(f"Error executing version2 with args {concrete_args}: {e}")
+                continue
+            
+            checked_count += 1
+            
+        except Exception as e:
+            print(f"Error processing deadended state {i}: {e}")
+            continue
+    
     if not found_regression:
-        print("[-] No regression found.")
+        print(f"[-] No regression found after checking {checked_count} states")
 
 if __name__ == "__main__":
     main()
